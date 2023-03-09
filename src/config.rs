@@ -127,14 +127,13 @@ impl Default for Config {
             purge_rewrite_threshold: None,
             purge_rewrite_garbage_ratio: 0.6,
             memory_limit: None,
-            enable_log_recycle: false,
+            enable_log_recycle: true,
             prefill_for_recycle: false,
         };
         // Test-specific configurations.
         #[cfg(test)]
         {
             cfg.memory_limit = Some(ReadableSize(0));
-            cfg.enable_log_recycle = true;
         }
         cfg
     }
