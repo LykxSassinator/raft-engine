@@ -422,42 +422,6 @@ fn test_tail_corruption() {
         let engine = Engine::open_with_file_system(cfg, fs.clone()).unwrap();
         assert_eq!(engine.first_index(rid), None);
     }
-    // Tail entries block is corrupted.
-    {
-        let dir = tempfile::Builder::new()
-            .prefix("test_tail_corruption_1_1")
-            .tempdir()
-            .unwrap();
-        let cfg = Config {
-            dir: dir.path().to_str().unwrap().to_owned(),
-            format_version: Version::V2,
-            ..Default::default()
-        };
-        let engine = Engine::open_with_file_system(cfg.clone(), fs.clone()).unwrap();
-        let _f = FailGuard::new("log_batch::corrupted_entries", "return");
-        append(&engine, rid, 1, 5, Some(&data));
-        drop(engine);
-        let engine = Engine::open_with_file_system(cfg, fs.clone()).unwrap();
-        assert_eq!(engine.first_index(rid), None);
-    }
-    // Repeat with absolute consistency.
-    {
-        let dir = tempfile::Builder::new()
-            .prefix("test_tail_corruption_1_2")
-            .tempdir()
-            .unwrap();
-        let cfg = Config {
-            dir: dir.path().to_str().unwrap().to_owned(),
-            format_version: Version::V2,
-            recovery_mode: RecoveryMode::AbsoluteConsistency,
-            ..Default::default()
-        };
-        let engine = Engine::open_with_file_system(cfg.clone(), fs.clone()).unwrap();
-        let _f = FailGuard::new("log_batch::corrupted_entries", "return");
-        append(&engine, rid, 1, 5, Some(&data));
-        drop(engine);
-        assert!(Engine::open_with_file_system(cfg, fs.clone()).is_err());
-    }
     // Header is corrupted.
     {
         let _f = FailGuard::new("log_file_header::corrupted", "return");
@@ -1185,4 +1149,98 @@ fn test_build_engine_with_recycling_and_multi_dirs() {
             (append_first, append_end)
         );
     }
+}
+
+#[test]
+fn test_concurrent_write_admin() {
+    let dir = tempfile::Builder::new()
+        .prefix("test_concurrent_write_admin")
+        .tempdir()
+        .unwrap();
+
+    let cfg = Config {
+        dir: dir.path().join("a").to_str().unwrap().to_owned(),
+        spill_dir: Some(dir.path().join("b").to_str().unwrap().to_owned()),
+        target_file_size: ReadableSize(1000000),
+        ..Default::default()
+    };
+
+    let some_entries = vec![
+        Entry::new(),
+        Entry {
+            index: 1,
+            ..Default::default()
+        },
+    ];
+
+    let engine = Arc::new(Engine::open(cfg).unwrap());
+    let steps = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::new();
+
+    let steps1 = steps.clone();
+    fail::cfg_callback("write_barrier::leader_exit", move || {
+        while steps1.load(Ordering::Relaxed) != 4 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+    .unwrap();
+
+    // Leader
+    let engine1 = engine.clone();
+    let some_entries1 = some_entries.clone();
+    let steps1 = steps.clone();
+    threads.push(std::thread::spawn(move || {
+        let mut log_batch = LogBatch::default();
+        log_batch
+            .add_entries::<MessageExtTyped>(1, &some_entries1)
+            .unwrap();
+        assert_eq!(steps1.fetch_add(1, Ordering::Relaxed), 0);
+        engine1.write(&mut log_batch, true).unwrap();
+    }));
+
+    while steps.load(Ordering::Relaxed) != 1 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Follower.
+    let engine1 = engine.clone();
+    let steps1 = steps.clone();
+    threads.push(std::thread::spawn(move || {
+        let mut log_batch = LogBatch::default();
+        log_batch
+            .add_entries::<MessageExtTyped>(2, &some_entries)
+            .unwrap();
+        assert_eq!(steps1.fetch_add(1, Ordering::Relaxed), 1);
+        engine1.write(&mut log_batch, true).unwrap();
+        assert_eq!(steps1.fetch_add(1, Ordering::Relaxed), 4);
+    }));
+
+    while steps.load(Ordering::Relaxed) != 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Admin
+    let engine1 = engine.clone();
+    let steps1 = steps.clone();
+    threads.push(std::thread::spawn(move || {
+        assert_eq!(steps1.fetch_add(1, Ordering::Relaxed), 2);
+        engine1.switch_disk().unwrap();
+    }));
+
+    while steps.load(Ordering::Relaxed) != 3 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Unblock leader.
+    fail::remove("write_barrier::leader_exit");
+    assert_eq!(steps.fetch_add(1, Ordering::Relaxed), 3);
+
+    while steps.load(Ordering::Relaxed) != 5 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (a, b) = engine.file_span(LogQueue::Append);
+    assert_eq!(a + 1, b);
 }

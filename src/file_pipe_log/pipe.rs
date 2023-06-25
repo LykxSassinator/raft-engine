@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use crossbeam::utils::CachePadded;
 use fail::fail_point;
@@ -52,6 +55,8 @@ struct WritableFile<F: FileSystem> {
 pub(super) struct SinglePipe<F: FileSystem> {
     queue: LogQueue,
     paths: Paths,
+    /// Preferred path id. It can be modified by `switch_disk`.
+    prefer_path_id: AtomicUsize,
     file_system: Arc<F>,
     listeners: Vec<Arc<dyn EventListener>>,
     default_format: LogFileFormat,
@@ -118,7 +123,8 @@ impl<F: FileSystem> SinglePipe<F> {
         // Open or create active file.
         let no_active_files = active_files.is_empty();
         if no_active_files {
-            let path_id = find_available_dir(&paths, cfg.target_file_size.0 as usize);
+            let path_id =
+                find_available_dir(&paths, cfg.target_file_size.0 as usize, DEFAULT_PATH_ID);
             let file_id = FileId::new(queue, DEFAULT_FIRST_FILE_SEQ);
             let path = file_id.build_file_path(&paths[path_id]);
             active_files.push(File {
@@ -153,6 +159,7 @@ impl<F: FileSystem> SinglePipe<F> {
         let pipe = Self {
             queue,
             paths,
+            prefer_path_id: AtomicUsize::new(DEFAULT_PATH_ID),
             file_system,
             listeners,
             default_format,
@@ -188,6 +195,14 @@ impl<F: FileSystem> SinglePipe<F> {
         };
         let (recycle_file, recycle_len) = {
             let mut recycled_files = self.recycled_files.write();
+            // // If the expected recycling file is not stored on the preferred path, it
+            // should be skipped.
+            let prefer_path_id = self.prefer_path_id.load(Ordering::Relaxed);
+            if !recycled_files.is_empty()
+                && recycled_files.front().unwrap().path_id != prefer_path_id
+            {
+                return None;
+            }
             (recycled_files.pop_front(), recycled_files.len())
         };
         if let Some(f) = recycle_file {
@@ -220,7 +235,11 @@ impl<F: FileSystem> SinglePipe<F> {
             seq,
             queue: self.queue,
         };
-        let path_id = find_available_dir(&self.paths, self.target_file_size);
+        let path_id = find_available_dir(
+            &self.paths,
+            self.target_file_size,
+            self.prefer_path_id.load(Ordering::Relaxed),
+        );
         let path = new_file_id.build_file_path(&self.paths[path_id]);
         Ok((path_id, self.file_system.create(path)?))
     }
@@ -237,7 +256,11 @@ impl<F: FileSystem> SinglePipe<F> {
     /// Creates a new file for write, and rotates the active log file.
     ///
     /// This operation is atomic in face of errors.
-    fn rotate_imp(&self, writable_file: &mut MutexGuard<WritableFile<F>>) -> Result<()> {
+    fn rotate_imp(
+        &self,
+        writable_file: &mut MutexGuard<WritableFile<F>>,
+        switch_disk: bool,
+    ) -> Result<()> {
         let _t = StopWatch::new((
             &*LOG_ROTATE_DURATION_HISTOGRAM,
             perf_context!(log_rotate_duration),
@@ -247,9 +270,23 @@ impl<F: FileSystem> SinglePipe<F> {
 
         writable_file.writer.close()?;
 
-        let (path_id, handle) = self
-            .recycle_file(new_seq)
-            .unwrap_or_else(|| self.new_file(new_seq))?;
+        let (path_id, handle) = if switch_disk {
+            if self.paths.len() == 1 {
+                return Err(Error::InvalidArgument("no available path".to_owned()));
+            }
+            let file_id = FileId {
+                seq: new_seq,
+                queue: self.queue,
+            };
+            let path_id = (self.active_files.read().back().unwrap().path_id + 1) % self.paths.len();
+            // Update preferred path_id.
+            self.prefer_path_id.store(path_id, Ordering::Relaxed);
+            let path = file_id.build_file_path(&self.paths[path_id]);
+            (path_id, self.file_system.create(path)?)
+        } else {
+            self.recycle_file(new_seq)
+                .unwrap_or_else(|| self.new_file(new_seq))?
+        };
         let f = File::<F> {
             seq: new_seq,
             handle: handle.into(),
@@ -318,7 +355,7 @@ impl<F: FileSystem> SinglePipe<F> {
         fail_point!("file_pipe_log::append");
         let mut writable_file = self.writable_file.lock();
         if writable_file.writer.offset() >= self.target_file_size {
-            if let Err(e) = self.rotate_imp(&mut writable_file) {
+            if let Err(e) = self.rotate_imp(&mut writable_file, false) {
                 panic!(
                     "error when rotate [{:?}:{}]: {e}",
                     self.queue, writable_file.seq,
@@ -369,7 +406,7 @@ impl<F: FileSystem> SinglePipe<F> {
                 // - [3] Both main-dir and spill-dir have several recycled logs.
                 // But as `bytes.len()` is always smaller than `target_file_size` in common
                 // cases, this issue will be ignored temprorarily.
-                if let Err(e) = self.rotate_imp(&mut writable_file) {
+                if let Err(e) = self.rotate_imp(&mut writable_file, true) {
                     panic!(
                         "error when rotate [{:?}:{}]: {e}",
                         self.queue, writable_file.seq
@@ -422,8 +459,8 @@ impl<F: FileSystem> SinglePipe<F> {
         (last_seq - first_seq + 1) as usize * self.target_file_size
     }
 
-    fn rotate(&self) -> Result<()> {
-        self.rotate_imp(&mut self.writable_file.lock())
+    fn rotate(&self, switch_disk: bool) -> Result<()> {
+        self.rotate_imp(&mut self.writable_file.lock(), switch_disk)
     }
 
     fn purge_to(&self, file_seq: FileSeq) -> Result<usize> {
@@ -532,8 +569,8 @@ impl<F: FileSystem> PipeLog for DualPipes<F> {
     }
 
     #[inline]
-    fn rotate(&self, queue: LogQueue) -> Result<()> {
-        self.pipes[queue as usize].rotate()
+    fn rotate(&self, queue: LogQueue, switch_disk: bool) -> Result<()> {
+        self.pipes[queue as usize].rotate(switch_disk)
     }
 
     #[inline]
@@ -543,21 +580,31 @@ impl<F: FileSystem> PipeLog for DualPipes<F> {
 }
 
 /// Fetch and return a valid `PathId` of the specific directories.
-pub(crate) fn find_available_dir(paths: &Paths, target_size: usize) -> PathId {
+pub(crate) fn find_available_dir(
+    paths: &Paths,
+    target_size: usize,
+    prefer_path_id: PathId,
+) -> PathId {
     fail_point!("file_pipe_log::force_choose_dir", |s| s
         .map_or(DEFAULT_PATH_ID, |n| n.parse::<usize>().unwrap()));
-    // Only if one single dir is set by `Config::dir`, can it skip the check of disk
-    // space usage.
-    if paths.len() > 1 {
-        for (t, p) in paths.iter().enumerate() {
-            if let Ok(disk_stats) = fs2::statvfs(p) {
+    // Only if one single dir is set by `Config::dir`, can it skip the check of
+    // disk space usage.
+    let paths_len = paths.len();
+    if paths_len > 1 {
+        let mut path_id = prefer_path_id;
+        loop {
+            if let Ok(disk_stats) = fs2::statvfs(&paths[path_id]) {
                 if target_size <= disk_stats.available_space() as usize {
-                    return t;
+                    return path_id;
                 }
+            }
+            path_id = (path_id + 1) % paths_len;
+            if path_id == prefer_path_id {
+                break;
             }
         }
     }
-    DEFAULT_PATH_ID
+    prefer_path_id
 }
 
 #[cfg(test)]
@@ -645,7 +692,7 @@ mod tests {
         assert_eq!(file_handle.offset, header_size);
         assert_eq!(pipe_log.file_span(queue).1, 2);
 
-        pipe_log.rotate(queue).unwrap();
+        pipe_log.rotate(queue, false).unwrap();
 
         // purge file 1
         assert_eq!(pipe_log.purge_to(FileId { queue, seq: 2 }).unwrap(), 1);
@@ -715,7 +762,7 @@ mod tests {
             handles.push(pipe_log.append(&mut &content(i)).unwrap());
             pipe_log.sync().unwrap();
         }
-        pipe_log.rotate().unwrap();
+        pipe_log.rotate(false).unwrap();
         let (first, last) = pipe_log.file_span();
         // Cannot purge already expired logs or not existsed logs.
         assert!(pipe_log.purge_to(first - 1).is_err());

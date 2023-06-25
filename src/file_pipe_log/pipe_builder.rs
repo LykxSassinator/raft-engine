@@ -17,7 +17,7 @@ use crate::config::{Config, RecoveryMode};
 use crate::env::{FileSystem, Handle, Permission};
 use crate::errors::is_no_space_err;
 use crate::event_listener::EventListener;
-use crate::log_batch::{LogItemBatch, LOG_BATCH_HEADER_LEN};
+use crate::log_batch::LogItemBatch;
 use crate::pipe_log::{FileId, FileSeq, LogQueue};
 use crate::util::{Factory, ReadableSize};
 use crate::{Error, Result};
@@ -28,6 +28,7 @@ use super::format::{
 use super::log_file::build_file_reader;
 use super::pipe::{
     find_available_dir, DualPipes, File, PathId, Paths, SinglePipe, DEFAULT_FIRST_FILE_SEQ,
+    DEFAULT_PATH_ID,
 };
 use super::reader::LogItemBatchFileReader;
 
@@ -403,78 +404,56 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                 let file_count = chunk.len();
                 for (i, f) in chunk.iter_mut().enumerate() {
                     let is_last_file = index == chunk_count - 1 && i == file_count - 1;
-                    let file_reader = build_file_reader(file_system.as_ref(), f.handle.clone())?;
-                    match reader.open(FileId { queue, seq: f.seq }, file_reader) {
-                        Err(e) if matches!(e, Error::Io(_)) => return Err(e),
+                    let mut file_reader = build_file_reader(file_system.as_ref(), f.handle.clone())?;
+                    match file_reader.parse_format() {
                         Err(e) => {
                             // TODO: More reliable tail detection.
                             if recovery_mode == RecoveryMode::TolerateAnyCorruption
                               || recovery_mode == RecoveryMode::TolerateTailCorruption
                                 && is_last_file {
                                 warn!(
-                                    "Truncating log file due to broken header (queue={:?},seq={}): {}",
-                                    queue, f.seq, e
+                                    "File header is corrupted but ignored: {queue:?}:{}, {e}",
+                                    f.seq,
                                 );
                                 f.handle.truncate(0)?;
                                 f.format = LogFileFormat::default();
                                 continue;
                             } else {
                                 error!(
-                                    "Failed to open log file due to broken header (queue={:?},seq={}): {}",
-                                    queue, f.seq, e
+                                    "Failed to open log file due to broken header: {queue:?}:{}, {e}",
+                                    f.seq
                                 );
                                 return Err(e);
                             }
                         },
                         Ok(format) => {
                             f.format = format;
+                            reader.open(FileId { queue, seq: f.seq }, format, file_reader)?;
                         }
                     }
-                    let mut pending_item = None;
                     loop {
-                        match pending_item.unwrap_or_else(|| reader.next()) {
+                        match reader.next() {
                             Ok(Some(item_batch)) => {
-                                let next_item = reader.next();
-                                // This is the last item. Check entries block.
-                                if_chain::if_chain! {
-                                    if matches!(next_item, Err(_) | Ok(None));
-                                    if let Some(ei) = item_batch.entry_index();
-                                    let handle = ei.entries.unwrap();
-                                    if let Err(e) = crate::LogBatch::decode_entries_block(
-                                        &reader.reader.as_mut().unwrap().read(handle)?,
-                                        handle,
-                                        ei.compression_type,
-                                    );
-                                    then {
-                                        let offset = handle.offset as usize - LOG_BATCH_HEADER_LEN;
-                                        if recovery_mode == RecoveryMode::AbsoluteConsistency {
-                                            error!(
-                                                "Failed to open log file due to broken entry (queue={:?},seq={},offset={}): {}",
-                                                queue, f.seq, offset, e
-                                            );
-                                            return Err(e);
-                                        } else {
-                                            warn!(
-                                                "Truncating log file due to broken entries block (queue={:?},seq={},offset={}): {}",
-                                                queue, f.seq, offset, e
-                                            );
-                                            f.handle.truncate(offset)?;
-                                            f.handle.sync()?;
-                                            break;
-                                        }
-                                    }
-                                }
-                                pending_item = Some(next_item);
-                                machine.replay(item_batch, FileId { queue, seq: f.seq })?;
+                                machine
+                                    .replay(item_batch, FileId { queue, seq: f.seq })?;
                             }
                             Ok(None) => break,
                             Err(e)
                                 if recovery_mode == RecoveryMode::TolerateTailCorruption
-                                    && is_last_file || recovery_mode == RecoveryMode::TolerateAnyCorruption =>
+                                    && is_last_file =>
                             {
                                 warn!(
-                                    "Truncating log file due to broken batch (queue={:?},seq={},offset={}): {}",
-                                    queue, f.seq, reader.valid_offset(), e
+                                    "The last log file is corrupted but ignored: {queue:?}:{}, {e}",
+                                    f.seq
+                                );
+                                f.handle.truncate(reader.valid_offset())?;
+                                f.handle.sync()?;
+                                break;
+                            }
+                            Err(e) if recovery_mode == RecoveryMode::TolerateAnyCorruption => {
+                                warn!(
+                                    "File is corrupted but ignored: {queue:?}:{}, {e}",
+                                    f.seq,
                                 );
                                 f.handle.truncate(reader.valid_offset())?;
                                 f.handle.sync()?;
@@ -482,8 +461,8 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                             }
                             Err(e) => {
                                 error!(
-                                    "Failed to open log file due to broken batch (queue={:?},seq={},offset={}): {}",
-                                    queue, f.seq, reader.valid_offset(), e
+                                    "Failed to open log file due to broken entry: {queue:?}:{} offset={}, {e}",
+                                    f.seq, reader.valid_offset()
                                 );
                                 return Err(e);
                             }
@@ -543,7 +522,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                     .last()
                     .map(|f| f.seq + 1)
                     .unwrap_or_else(|| DEFAULT_FIRST_FILE_SEQ);
-                let path_id = find_available_dir(&self.dirs, target_file_size);
+                let path_id = find_available_dir(&self.dirs, target_file_size, DEFAULT_PATH_ID);
                 let root_path = &self.dirs[path_id];
                 let path = root_path.join(build_reserved_file_name(seq));
                 let handle = Arc::new(self.file_system.create(path)?);

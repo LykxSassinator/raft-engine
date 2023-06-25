@@ -13,7 +13,7 @@ use super::log_file::LogFileReader;
 pub(super) struct LogItemBatchFileReader<F: FileSystem> {
     file_id: Option<FileId>,
     format: Option<LogFileFormat>,
-    pub(crate) reader: Option<LogFileReader<F>>,
+    reader: Option<LogFileReader<F>>,
     size: usize,
 
     buffer: Vec<u8>,
@@ -44,8 +44,12 @@ impl<F: FileSystem> LogItemBatchFileReader<F> {
     }
 
     /// Opens a file that can be accessed through the given reader.
-    pub fn open(&mut self, file_id: FileId, mut reader: LogFileReader<F>) -> Result<LogFileFormat> {
-        let format = reader.parse_format()?;
+    pub fn open(
+        &mut self,
+        file_id: FileId,
+        format: LogFileFormat,
+        reader: LogFileReader<F>,
+    ) -> Result<()> {
         self.valid_offset = LogFileFormat::encoded_len(format.version);
         self.file_id = Some(file_id);
         self.format = Some(format);
@@ -53,7 +57,7 @@ impl<F: FileSystem> LogItemBatchFileReader<F> {
         self.reader = Some(reader);
         self.buffer.clear();
         self.buffer_offset = 0;
-        Ok(format)
+        Ok(())
     }
 
     /// Closes any ongoing file access.
