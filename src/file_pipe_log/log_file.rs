@@ -123,6 +123,8 @@ impl<F: FileSystem> LogFileWriter<F> {
             self.capacity += alloc;
         }
         if aligned {
+            // FIXME: the aligned buffer should support reusing and extending, to reduce the
+            // cost on repeatly alloc & dealloc the aligned memory.
             let aligned_buffer = AlignedBuffer::new(buf, FILE_DEFAULT_ZERO_PADDING_ALIGNMENT);
             self.writer.write_all(aligned_buffer.as_slice())
         } else {
@@ -140,6 +142,7 @@ impl<F: FileSystem> LogFileWriter<F> {
         self.written = new_written;
         self.written_hint = new_written_hint;
         // Reset the writter to the offset of real data ptr.
+        // FIXME: the re-seek operation might be a cost-heavy operation.
         self.writer
             .seek(SeekFrom::Start(self.written_hint as u64))?;
         Ok(())
