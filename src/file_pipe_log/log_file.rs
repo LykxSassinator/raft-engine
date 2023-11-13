@@ -11,12 +11,15 @@ use log::warn;
 use crate::env::{FileSystem, Handle, WriteExt};
 use crate::metrics::*;
 use crate::pipe_log::FileBlockHandle;
+use crate::util::{round_up, AlignedBuffer};
 use crate::{Error, Result};
 
 use super::format::LogFileFormat;
 
 /// Maximum number of bytes to allocate ahead.
 const FILE_ALLOCATE_SIZE: usize = 2 * 1024 * 1024;
+/// Default alignment for zero-padding.
+const FILE_DEFAULT_ZERO_PADDING_ALIGNMENT: usize = 4096;
 
 /// Builds a file writer.
 ///
@@ -39,7 +42,8 @@ pub(super) fn build_file_writer<F: FileSystem>(
 pub struct LogFileWriter<F: FileSystem> {
     handle: Arc<F::Handle>,
     writer: F::Writer,
-    written: usize,
+    written: usize,      // Offset of written data (contains zero-paddings)
+    written_hint: usize, // Real offset of written data
     capacity: usize,
 }
 
@@ -55,6 +59,7 @@ impl<F: FileSystem> LogFileWriter<F> {
             handle,
             writer,
             written: file_size,
+            written_hint: file_size,
             capacity: file_size,
         };
         // TODO: add tests for file_size in [header_len, max_encoded_len].
@@ -69,6 +74,7 @@ impl<F: FileSystem> LogFileWriter<F> {
     fn write_header(&mut self, format: LogFileFormat) -> IoResult<()> {
         self.writer.seek(SeekFrom::Start(0))?;
         self.written = 0;
+        self.written_hint = 0;
         let mut buf = Vec::with_capacity(LogFileFormat::encoded_len(format.version));
         format.encode(&mut buf).unwrap();
         self.write(&buf, 0)
@@ -85,14 +91,25 @@ impl<F: FileSystem> LogFileWriter<F> {
             fail_point!("file_pipe_log::log_file_writer::skip_truncate", |_| {
                 Ok(())
             });
-            self.writer.truncate(self.written)?;
-            self.capacity = self.written;
+            self.writer.truncate(self.written_hint)?;
+            self.capacity = self.written_hint;
         }
         Ok(())
     }
 
     pub fn write(&mut self, buf: &[u8], target_size_hint: usize) -> IoResult<()> {
-        let new_written = self.written + buf.len();
+        let (new_written, new_written_hint, aligned) = {
+            let new_written_hint = self.written_hint + buf.len();
+            if new_written_hint > self.written {
+                (
+                    round_up(new_written_hint, FILE_DEFAULT_ZERO_PADDING_ALIGNMENT),
+                    new_written_hint,
+                    true,
+                )
+            } else {
+                (self.written, new_written_hint, false)
+            }
+        };
         if self.capacity < new_written {
             let _t = StopWatch::new(&*LOG_ALLOCATE_DURATION_HISTOGRAM);
             let alloc = std::cmp::min(
@@ -105,7 +122,13 @@ impl<F: FileSystem> LogFileWriter<F> {
             }
             self.capacity += alloc;
         }
-        self.writer.write_all(buf).map_err(|e| {
+        if aligned {
+            let aligned_buffer = AlignedBuffer::new(buf, FILE_DEFAULT_ZERO_PADDING_ALIGNMENT);
+            self.writer.write_all(aligned_buffer.as_slice())
+        } else {
+            self.writer.write_all(buf)
+        }
+        .map_err(|e| {
             self.writer
                 .seek(SeekFrom::Start(self.written as u64))
                 .unwrap_or_else(|e| {
@@ -113,7 +136,12 @@ impl<F: FileSystem> LogFileWriter<F> {
                 });
             e
         })?;
+        assert!(new_written >= new_written_hint);
         self.written = new_written;
+        self.written_hint = new_written_hint;
+        // Reset the writter to the offset of real data ptr.
+        self.writer
+            .seek(SeekFrom::Start(self.written_hint as u64))?;
         Ok(())
     }
 
@@ -125,7 +153,7 @@ impl<F: FileSystem> LogFileWriter<F> {
 
     #[inline]
     pub fn offset(&self) -> usize {
-        self.written
+        self.written_hint
     }
 }
 

@@ -4,6 +4,8 @@ use std::fmt::{self, Display, Write};
 use std::ops::{Div, Mul};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use std::{alloc::alloc, alloc::Layout};
+use std::{ptr, ptr::NonNull};
 
 use crc32fast::Hasher;
 use serde::de::{self, Unexpected, Visitor};
@@ -339,6 +341,48 @@ pub fn round_up(offset: usize, alignment: usize) -> usize {
 #[inline]
 pub fn round_down(offset: usize, alignment: usize) -> usize {
     offset / alignment * alignment
+}
+
+pub struct AlignedBuffer {
+    buf: Vec<u8>,
+}
+
+impl AlignedBuffer {
+    pub fn new(bytes: &[u8], alignment: usize) -> Self {
+        let bytes_len = bytes.len();
+        // Calculate padding length
+        let padding_len = if bytes_len % alignment == 0 {
+            0
+        } else {
+            alignment - (bytes_len % alignment)
+        };
+        // Allocate aligned buffer
+        let layout = Layout::from_size_align(bytes_len + padding_len, alignment)
+            .expect("Invalid alignment and size values");
+        let buffer_ptr = NonNull::new(unsafe { alloc(layout) as *mut u8 })
+            .expect("Failed to allocate aligned buffer");
+        // Write data to buffer
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer_ptr.as_ptr(), bytes_len);
+        }
+        // Zero-padding
+        unsafe {
+            ptr::write_bytes(buffer_ptr.as_ptr().add(bytes_len), 0, padding_len);
+        }
+        Self {
+            buf: unsafe {
+                Vec::from_raw_parts(
+                    buffer_ptr.as_ptr(),
+                    bytes_len + padding_len,
+                    bytes_len + padding_len,
+                )
+            },
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 #[cfg(test)]
